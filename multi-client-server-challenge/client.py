@@ -1,68 +1,120 @@
 import socket
+import struct
+import hashlib
 import os
+import signal
+import sys
 
-CHUNK_SIZE = 4096
-SERVER_IP = "127.0.0.1"
-SERVER_PORT = 5000
+SERVER_HOST = '127.0.0.1'
+SERVER_PORT = 5001
+CHUNK_SIZE = 1024
 
-def send_file(client_socket, file_path):
-    """Send a file to the server efficiently."""
-    if not os.path.exists(file_path):
-        print(f"[-] Error: File '{file_path}' does not exist.")
-        return
+client_socket = None
 
-    filename = os.path.basename(file_path)
-    client_socket.sendall(f"UPLOAD {filename}".encode())
 
+def compute_checksum(file_path):
+    """Compute SHA256 checksum of a file."""
+    sha256 = hashlib.sha256()
     with open(file_path, "rb") as f:
         while chunk := f.read(CHUNK_SIZE):
-            client_socket.sendall(chunk)
+            sha256.update(chunk)
+    return sha256.hexdigest()
 
-    client_socket.sendall(b"EOF")  # Mark file end
 
-    response = client_socket.recv(64).decode()
-    if response == "UPLOAD_SUCCESS":
-        print(f"[✔] File '{filename}' uploaded successfully!")
+def get_all_files(directory):
+    """Get all file paths recursively in a directory."""
+    file_paths = []
+    for root, _, files in os.walk(directory):
+        for file in files:
+            file_paths.append(os.path.join(root, file))
+    return file_paths
 
-def retrieve_file(client_socket, filename):
-    """Retrieve a file from the server."""
-    client_socket.sendall(f"RETRIEVE {filename}".encode())
 
-    received_file = f"retrieved_{filename}"
-    with open(received_file, "wb") as f:
-        while True:
-            chunk = client_socket.recv(CHUNK_SIZE)
-            if chunk.endswith(b"EOF"):
-                f.write(chunk[:-3])  # Remove "EOF" marker
-                break
+def upload_files(files):
+    """Handles file upload to the server."""
+    global client_socket
+    client_socket.send(struct.pack("I", 1))  # Upload operation
+    client_socket.send(struct.pack("I", len(files)))  # Number of files
+
+    for file_path in files:
+        relative_path = os.path.relpath(file_path, start=os.path.dirname(files[0]))  # Keep relative structure
+        client_socket.send(struct.pack("I", len(relative_path)))
+        client_socket.send(relative_path.encode())
+
+        file_size = os.path.getsize(file_path)
+        client_socket.send(struct.pack("Q", file_size))
+
+        with open(file_path, "rb") as f:
+            while chunk := f.read(CHUNK_SIZE):
+                client_socket.send(chunk)
+
+        server_checksum = client_socket.recv(64).decode()
+        client_checksum = compute_checksum(file_path)
+        client_socket.send(client_checksum.encode())
+
+        if client_checksum == server_checksum:
+            print(f"[✔] {relative_path} uploaded successfully ✅")
+        else:
+            print(f"[-] {relative_path} checksum mismatch ❌")
+
+
+def download_file(file_name, save_dir):
+    """Handles file download from the server."""
+    global client_socket
+    client_socket.send(struct.pack("I", 2))  # Download operation
+    client_socket.send(struct.pack("I", len(file_name)))
+    client_socket.send(file_name.encode())
+
+    file_size = struct.unpack("Q", client_socket.recv(8))[0]
+
+    if file_size == 0:
+        print(f"[-] File not found on server: {file_name}")
+        return
+
+    save_path = os.path.join(save_dir, file_name)
+    os.makedirs(os.path.dirname(save_path), exist_ok=True)
+
+    with open(save_path, "wb") as f:
+        while file_size > 0:
+            chunk = client_socket.recv(min(CHUNK_SIZE, file_size))
             f.write(chunk)
+            file_size -= len(chunk)
 
-    print(f"[✔] File '{received_file}' downloaded successfully!")
+    server_checksum = client_socket.recv(64).decode()
+    client_checksum = compute_checksum(save_path)
+    client_socket.send(client_checksum.encode())
+
+    if client_checksum == server_checksum:
+        print(f"[✔] {file_name} downloaded successfully ✅")
+    else:
+        print(f"[-] {file_name} checksum mismatch ❌")
+
+
+def exit_gracefully(signal_received, frame):
+    """Handles CTRL+C (SIGINT) to exit the client cleanly."""
+    print("\n[+] Exiting client...")
+    if client_socket:
+        client_socket.close()
+    sys.exit(0)
+
 
 def main():
+    global client_socket
+    signal.signal(signal.SIGINT, exit_gracefully)
+
     client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    client_socket.connect((SERVER_IP, SERVER_PORT))
+    client_socket.connect((SERVER_HOST, SERVER_PORT))
+    print(f"[+] Connected to server at {SERVER_HOST}:{SERVER_PORT}")
 
-    while True:
-        action = input("\nChoose an action: (upload/retrieve/close) ").strip().lower()
+    choice = input("Enter folder path to upload: ").strip()
+    if os.path.isdir(choice):
+        files = get_all_files(choice)
+        upload_files(files)
+    else:
+        print("[-] Invalid folder path.")
 
-        if action == "upload":
-            file_path = input("Enter the file path to upload: ").strip()
-            send_file(client_socket, file_path)
+    exit_gracefully(None, None)
 
-        elif action == "retrieve":
-            filename = input("Enter the filename to retrieve: ").strip()
-            retrieve_file(client_socket, filename)
-
-        elif action == "close":
-            client_socket.sendall("CLOSE".encode())
-            print("[✔] Connection closed.")
-            break
-
-        else:
-            print("[-] Invalid command. Try again.")
-
-    client_socket.close()
 
 if __name__ == "__main__":
     main()

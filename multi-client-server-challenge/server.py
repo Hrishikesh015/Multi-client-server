@@ -1,126 +1,128 @@
 import socket
-import os
 import threading
+import os
+import struct
+import hashlib
+import signal
 import sys
 
-CHUNK_SIZE = 4096
-SERVER_IP = "0.0.0.0"
-SERVER_PORT = 5000
-BASE_DIR = "server"
-running = True  # Control flag for stopping server
+SERVER_HOST = '0.0.0.0'
+SERVER_PORT = 5001
+CHUNK_SIZE = 1024
+UPLOAD_DIR = "uploads"
 
-os.makedirs(BASE_DIR, exist_ok=True)
+# Ensure upload directory exists
+os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Track client threads
-client_threads = []
-server_socket = None  # Declare globally for cleanup
+server_socket = None
+shutdown_event = threading.Event()
 
 
-def handle_client(client_socket, client_address):
-    """Handle client connection for file uploads & retrievals."""
-    client_id = f"{client_address[0]}_{client_address[1]}"
-    client_dir = os.path.join(BASE_DIR, client_id)
-    os.makedirs(client_dir, exist_ok=True)
+def compute_checksum(file_path):
+    """Compute SHA256 checksum of a file."""
+    sha256 = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        while chunk := f.read(CHUNK_SIZE):
+            sha256.update(chunk)
+    return sha256.hexdigest()
 
-    print(f"[+] Client {client_id} connected.")
 
+def handle_client(client_socket, client_id):
     try:
-        while True:
-            command = client_socket.recv(256).decode().strip()
-            if not command:
-                break
+        operation = struct.unpack("I", client_socket.recv(4))[0]  # Upload(1) or Download(2)
 
-            if command.startswith("UPLOAD"):
-                _, filename = command.split(" ", 1)
-                file_path = os.path.join(client_dir, filename)
-                print(f"[+] Receiving '{filename}' from {client_id}...")
+        if operation == 1:  # Upload
+            num_files = struct.unpack("I", client_socket.recv(4))[0]
 
-                with open(file_path, "wb") as f:
-                    while True:
-                        chunk = client_socket.recv(CHUNK_SIZE)
-                        if chunk.endswith(b"EOF"):
-                            f.write(chunk[:-3])  # Remove EOF marker
-                            break
+            for _ in range(num_files):
+                path_length = struct.unpack("I", client_socket.recv(4))[0]
+                file_path = client_socket.recv(path_length).decode()
+                server_file_path = os.path.join(UPLOAD_DIR, f"client_{client_id}", file_path)
+                os.makedirs(os.path.dirname(server_file_path), exist_ok=True)
+
+                file_size = struct.unpack("Q", client_socket.recv(8))[0]
+
+                with open(server_file_path, "wb") as f:
+                    while file_size > 0:
+                        chunk = client_socket.recv(min(CHUNK_SIZE, file_size))
                         f.write(chunk)
+                        file_size -= len(chunk)
 
-                print(f"[✔] File '{filename}' saved at {file_path}")
-                client_socket.sendall(b"UPLOAD_SUCCESS")
+                server_checksum = compute_checksum(server_file_path)
+                client_socket.send(server_checksum.encode())
 
-            elif command.startswith("RETRIEVE"):
-                _, filename = command.split(" ", 1)
-                file_path = os.path.join(client_dir, filename)
+                client_checksum = client_socket.recv(64).decode()
+                if client_checksum == server_checksum:
+                    print(f"[✔] [Client {client_id}] {file_path} received successfully ✅")
+                else:
+                    print(f"[-] [Client {client_id}] {file_path} checksum mismatch ❌")
 
-                if not os.path.exists(file_path):
-                    client_socket.sendall(b"ERROR: File not found")
-                    continue
+        elif operation == 2:  # Download
+            path_length = struct.unpack("I", client_socket.recv(4))[0]
+            file_name = client_socket.recv(path_length).decode()
+            file_path = os.path.join(UPLOAD_DIR, file_name)
 
-                print(f"[+] Sending '{filename}' to {client_id}...")
+            if not os.path.exists(file_path):
+                client_socket.send(struct.pack("Q", 0))  # File not found
+                return
 
-                with open(file_path, "rb") as f:
-                    while chunk := f.read(CHUNK_SIZE):
-                        client_socket.sendall(chunk)
+            file_size = os.path.getsize(file_path)
+            client_socket.send(struct.pack("Q", file_size))
 
-                client_socket.sendall(b"EOF")
-                print(f"[✔] File '{filename}' sent to {client_id}.")
+            with open(file_path, "rb") as f:
+                while chunk := f.read(CHUNK_SIZE):
+                    client_socket.send(chunk)
 
-            elif command == "CLOSE":
-                print(f"[-] Client {client_id} disconnected.")
-                break
+            server_checksum = compute_checksum(file_path)
+            client_socket.send(server_checksum.encode())
+
+            client_checksum = client_socket.recv(64).decode()
+            if client_checksum == server_checksum:
+                print(f"[✔] {file_name} sent successfully ✅")
+            else:
+                print(f"[-] {file_name} checksum mismatch ❌")
 
     except Exception as e:
-        print(f"[-] Error handling client {client_id}: {e}")
+        print(f"[-] [Client {client_id}] Error: {e}")
 
     finally:
         client_socket.close()
 
 
-def accept_clients():
-    """Accept clients in a separate thread."""
-    global server_socket
-    while running:
-        try:
-            client_socket, client_address = server_socket.accept()
-            thread = threading.Thread(target=handle_client, args=(client_socket, client_address))
-            thread.start()
-            client_threads.append(thread)
-        except OSError:
-            break  # Exit loop if server socket is closed
-
-
-def start_server():
-    """Start the multi-client file transfer server."""
-    global server_socket
-    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    server_socket.bind((SERVER_IP, SERVER_PORT))
-    server_socket.listen(5)
-    print(f"[✔] Server listening on {SERVER_IP}:{SERVER_PORT}")
-
-    accept_thread = threading.Thread(target=accept_clients, daemon=True)
-    accept_thread.start()
-
-    try:
-        while True:
-            pass  # Keep main thread active
-    except KeyboardInterrupt:
-        print("\n[+] Server shutting down...")
-        shutdown_server()
-
-
-def shutdown_server():
-    """Gracefully shutdown the server."""
-    global server_socket, running
-    running = False  # Stop accept loop
-
-    print("[+] Closing all connections...")
-    for thread in client_threads:
-        thread.join()  # Wait for all client threads to finish
-
+def exit_gracefully(signal_received, frame):
+    """Handles CTRL+C (SIGINT) to stop the server cleanly"""
+    print("\n[+] [Server] Shutting down gracefully...")
+    shutdown_event.set()
     if server_socket:
         server_socket.close()
-        print("[✔] Server socket closed.")
+    sys.exit(0)
 
-    sys.exit(0)  # Exit cleanly
+
+def main():
+    global server_socket
+    server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    server_socket.bind((SERVER_HOST, SERVER_PORT))
+    server_socket.listen(5)
+    server_socket.settimeout(1)
+
+    print(f"[+] Server listening on {SERVER_HOST}:{SERVER_PORT}")
+
+    signal.signal(signal.SIGINT, exit_gracefully)
+
+    client_id = 0
+    while not shutdown_event.is_set():
+        try:
+            client_socket, addr = server_socket.accept()
+            print(f"[+] New connection from {addr}, assigned Client ID: {client_id}")
+            threading.Thread(target=handle_client, args=(client_socket, client_id), daemon=True).start()
+            client_id += 1
+        except socket.timeout:
+            continue
+
+    print("[+] [Server] Exiting...")
+    server_socket.close()
 
 
 if __name__ == "__main__":
-    start_server()
+    main()
