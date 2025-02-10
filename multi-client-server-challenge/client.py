@@ -49,18 +49,27 @@ def upload_files(files):
             file_size = os.path.getsize(file_path)
             client_socket.send(struct.pack("Q", file_size))
 
+            chunk_id = 0
+
             with open(file_path, "rb") as f:
                 while chunk := f.read(CHUNK_SIZE):
                     chunk_checksum = compute_checksum(chunk).encode()
+                    chunk_id_str = str(chunk_id).zfill(4)
+                    print(chunk_id_str)
+                    print(chunk_id_str.encode())
+                    client_socket.send(chunk_id_str.encode())
                     client_socket.send(chunk)
                     client_socket.send(chunk_checksum)
 
                     response = client_socket.recv(5).decode()
                     while response == "RETRY":
-                        print(f"[-] [Retransmitting last chunk...")
+                        print(f"[-] [Retransmitting last chunk...{chunk_id}")
+                        print(chunk_id_str.encode())
                         client_socket.send(chunk)
                         client_socket.send(chunk_checksum)
                         response = client_socket.recv(5).decode()
+                    
+                    chunk_id += 1
 
             server_checksum = client_socket.recv(64).decode()
             client_checksum = compute_checksum(file_path)
@@ -72,7 +81,7 @@ def upload_files(files):
                 print(f"[-] {relative_path} checksum mismatch ❌")
     except ConnectionResetError:
         print('[-] Connecttion lost')
-        exit_gracefully()
+        exit_gracefully(None, None)
 
 
 
@@ -118,7 +127,7 @@ def download_file(file_name, save_dir):
             print(f"[-] {file_name} checksum mismatch ❌")
     except ConnectionResetError:
         print('[-] Connecttion lost')
-        exit_gracefully()
+        exit_gracefully(None, None)
 
 
 def list_files():
@@ -139,10 +148,10 @@ def list_files():
             print(f"  - {path}")
     except ConnectionResetError:
         print('[-] Connecttion lost')
-        exit_gracefully()
+        exit_gracefully(None, None)
 
 
-def exit_gracefully():
+def exit_gracefully(signal_recieved, frame):
     """Handles CTRL+C (SIGINT) to exit the client cleanly."""
     print("\n[+] Exiting client...")
     if client_socket:

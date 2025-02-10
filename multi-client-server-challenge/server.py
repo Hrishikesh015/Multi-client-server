@@ -51,17 +51,29 @@ def handle_client(client_socket, client_id):
                     server_file_path = os.path.join(UPLOAD_DIR, file_path)
                     os.makedirs(os.path.dirname(server_file_path), exist_ok=True)
                     file_size = struct.unpack("Q", client_socket.recv(8))[0]
+
+                    chunk_data = {}
+
+
+                    while file_size > 0:
+                        chunk_id = int(client_socket.recv(4).decode())
+                        print(chunk_id)
+                        chunk = client_socket.recv(min(CHUNK_SIZE, file_size))
+                        print(chunk_data)
+                        received_checksum = client_socket.recv(64).decode()
+                        if received_checksum == compute_checksum(chunk):
+                            chunk_data[chunk_id] = chunk
+                            file_size -= len(chunk)
+                            client_socket.send(b"ACK")  # Acknowledge successful chunk reception
+                        else:
+                            print(f"[-] [Client {client_id}] Checksum mismatch, requesting retransmission...")
+                            client_socket.send(b"RETRY")  # Ask client to resend the last chunk
+                    
+                    # Write chunks in order
                     with open(server_file_path, "wb") as f:
-                        while file_size > 0:
-                            chunk = client_socket.recv(min(CHUNK_SIZE, file_size))
-                            received_checksum = client_socket.recv(64).decode()
-                            if received_checksum == compute_checksum(chunk):
-                                f.write(chunk)
-                                file_size -= len(chunk)
-                                client_socket.send(b"ACK")  # Acknowledge successful chunk reception
-                            else:
-                                print(f"[-] [Client {client_id}] Checksum mismatch, requesting retransmission...")
-                                client_socket.send(b"RETRY")  # Ask client to resend the last chunk
+                        for i in sorted(chunk_data.keys()):
+                            f.write(chunk_data[i])
+                        
                     
                     server_checksum = compute_checksum(server_file_path)
                     client_socket.send(server_checksum.encode())
