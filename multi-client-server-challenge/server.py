@@ -5,6 +5,7 @@ import struct
 import hashlib
 import signal
 import sys
+import zlib
 
 SERVER_HOST = '0.0.0.0'
 SERVER_PORT = 5001
@@ -29,64 +30,91 @@ def compute_checksum(file_path):
 
 def handle_client(client_socket, client_id):
     try:
-        operation = struct.unpack("I", client_socket.recv(4))[0]  # Upload(1) or Download(2)
+        print(f"[+] [Client {client_id}] Connected.")
 
-        if operation == 1:  # Upload
-            num_files = struct.unpack("I", client_socket.recv(4))[0]
+        while True:
+            operation_data = client_socket.recv(4)
+            if not operation_data:
+                break  # Exit loop if the client disconnects
 
-            for _ in range(num_files):
-                path_length = struct.unpack("I", client_socket.recv(4))[0]
-                file_path = client_socket.recv(path_length).decode()
-                server_file_path = os.path.join(UPLOAD_DIR, f"client_{client_id}", file_path)
-                os.makedirs(os.path.dirname(server_file_path), exist_ok=True)
+            operation = struct.unpack("I", operation_data)[0]
 
-                file_size = struct.unpack("Q", client_socket.recv(8))[0]
+            if operation == 1:  # Upload
+                    num_files = struct.unpack("I", client_socket.recv(4))[0]
 
-                with open(server_file_path, "wb") as f:
-                    while file_size > 0:
-                        chunk = client_socket.recv(min(CHUNK_SIZE, file_size))
-                        f.write(chunk)
-                        file_size -= len(chunk)
+                    for _ in range(num_files):
+                        path_length = struct.unpack("I", client_socket.recv(4))[0]
+                        file_path = client_socket.recv(path_length).decode()
+                        server_file_path = os.path.join(UPLOAD_DIR, f"client_{client_id}", file_path)
+                        os.makedirs(os.path.dirname(server_file_path), exist_ok=True)
 
-                server_checksum = compute_checksum(server_file_path)
-                client_socket.send(server_checksum.encode())
+                        file_size = struct.unpack("Q", client_socket.recv(8))[0]
 
-                client_checksum = client_socket.recv(64).decode()
-                if client_checksum == server_checksum:
-                    print(f"[✔] [Client {client_id}] {file_path} received successfully ✅")
-                else:
-                    print(f"[-] [Client {client_id}] {file_path} checksum mismatch ❌")
+                        with open(server_file_path, "wb") as f:
+                            while file_size > 0:
+                                chunk = client_socket.recv(min(CHUNK_SIZE, file_size))
+                                f.write(chunk)
+                                file_size -= len(chunk)
 
-        elif operation == 2:  # Download
-            path_length = struct.unpack("I", client_socket.recv(4))[0]
-            file_name = client_socket.recv(path_length).decode()
-            file_path = os.path.join(UPLOAD_DIR, file_name)
+                        server_checksum = compute_checksum(server_file_path)
+                        client_socket.send(server_checksum.encode())
 
-            if not os.path.exists(file_path):
-                client_socket.send(struct.pack("Q", 0))  # File not found
-                return
+                        client_checksum = client_socket.recv(64).decode()
+                        if client_checksum == server_checksum:
+                            print(f"[✔] [Client {client_id}] {file_path} received successfully ✅")
+                        else:
+                            print(f"[-] [Client {client_id}] {file_path} checksum mismatch ❌")
+            elif operation == 2:  # Download
+                try:
+                    path_length = struct.unpack("I", client_socket.recv(4))[0]
+                    file_name = client_socket.recv(path_length).decode()
+                    file_path = os.path.join(UPLOAD_DIR, file_name)
 
-            file_size = os.path.getsize(file_path)
-            client_socket.send(struct.pack("Q", file_size))
+                    if not os.path.exists(file_path):
+                        client_socket.send(struct.pack("Q", 0))  # File not found
+                        return
 
-            with open(file_path, "rb") as f:
-                while chunk := f.read(CHUNK_SIZE):
-                    client_socket.send(chunk)
+                    file_size = os.path.getsize(file_path)
+                    client_socket.send(struct.pack("Q", file_size))
 
-            server_checksum = compute_checksum(file_path)
-            client_socket.send(server_checksum.encode())
+                    with open(file_path, "rb") as f:
+                        while chunk := f.read(CHUNK_SIZE):
+                            client_socket.send(chunk)
 
-            client_checksum = client_socket.recv(64).decode()
-            if client_checksum == server_checksum:
-                print(f"[✔] {file_name} sent successfully ✅")
-            else:
-                print(f"[-] {file_name} checksum mismatch ❌")
+                    server_checksum = compute_checksum(file_path)
+                    client_socket.send(server_checksum.encode())
+
+                    client_checksum = client_socket.recv(64).decode()
+                    if client_checksum == server_checksum:
+                        print(f"[✔] {file_name} sent successfully ✅")
+                    else:
+                        print(f"[-] {file_name} checksum mismatch ❌")
+
+                except Exception as e:
+                    print(f"[-] [Client {client_id}] Error: {e}")
+
+                finally:
+                    client_socket.close()
+            
+
+            elif operation == 3:  # List files
+                file_list = [os.path.relpath(os.path.join(root, f), UPLOAD_DIR) for root, _, files in os.walk(UPLOAD_DIR) for f in files]
+                client_socket.send(struct.pack("I", len(file_list)))
+                for file in file_list:
+                    client_socket.send(struct.pack("I", len(file)))
+                    client_socket.send(file.encode())
+
+            elif operation == 4:  # Exit
+                client_socket.close()
+                print(f"[!] [Client {client_id}] Disconnected.")
+                break
 
     except Exception as e:
         print(f"[-] [Client {client_id}] Error: {e}")
 
     finally:
         client_socket.close()
+
 
 
 def exit_gracefully(signal_received, frame):

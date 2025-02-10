@@ -4,6 +4,7 @@ import hashlib
 import os
 import signal
 import sys
+import zlib
 
 SERVER_HOST = '127.0.0.1'
 SERVER_PORT = 5001
@@ -12,12 +13,15 @@ CHUNK_SIZE = 1024
 client_socket = None
 
 
-def compute_checksum(file_path):
-    """Compute SHA256 checksum of a file."""
+def compute_checksum(data):
+    """Computes SHA-256 checksum of data (bytes or file path)."""
     sha256 = hashlib.sha256()
-    with open(file_path, "rb") as f:
-        while chunk := f.read(CHUNK_SIZE):
-            sha256.update(chunk)
+    if isinstance(data, str):  # File path case
+        with open(data, "rb") as f:
+            while chunk := f.read(CHUNK_SIZE):
+                sha256.update(chunk)
+    else:  # Bytes case (chunk)
+        sha256.update(data)
     return sha256.hexdigest()
 
 
@@ -58,6 +62,7 @@ def upload_files(files):
             print(f"[-] {relative_path} checksum mismatch ❌")
 
 
+
 def download_file(file_name, save_dir):
     """Handles file download from the server."""
     global client_socket
@@ -90,6 +95,24 @@ def download_file(file_name, save_dir):
         print(f"[-] {file_name} checksum mismatch ❌")
 
 
+
+def list_files():
+    """Request list of files and folders from the server."""
+    global client_socket
+    client_socket.send(struct.pack("I", 3))  # List operation
+
+    num_entries = struct.unpack("I", client_socket.recv(4))[0]
+    if num_entries == 0:
+        print("[!] No files or directories found on the server.")
+        return
+
+    print("\n[+] Files and Folders on the Server:")
+    for _ in range(num_entries):
+        path_length = struct.unpack("I", client_socket.recv(4))[0]
+        path = client_socket.recv(path_length).decode()
+        print(f"  - {path}")
+
+
 def exit_gracefully(signal_received, frame):
     """Handles CTRL+C (SIGINT) to exit the client cleanly."""
     print("\n[+] Exiting client...")
@@ -106,14 +129,37 @@ def main():
     client_socket.connect((SERVER_HOST, SERVER_PORT))
     print(f"[+] Connected to server at {SERVER_HOST}:{SERVER_PORT}")
 
-    choice = input("Enter folder path to upload: ").strip()
-    if os.path.isdir(choice):
-        files = get_all_files(choice)
-        upload_files(files)
-    else:
-        print("[-] Invalid folder path.")
+    while True:
+        print("\nOptions:")
+        print("1. List files/folders")
+        print("2. Upload file/folder")
+        print("3. Download file")
+        print("4. Exit")
+        choice = input("Enter your choice: ").strip()
 
-    exit_gracefully(None, None)
+        if choice == "1":
+            list_files()
+        elif choice == "2":
+            path = input("Enter file/folder path to upload: ").strip()
+            if os.path.isdir(path):
+                files = get_all_files(path)
+            elif os.path.isfile(path):
+                files = [path]
+            else:
+                print("[-] Invalid path.")
+                continue
+            upload_files(files)
+        elif choice == "3":
+            file_name = input("Enter file/folder name to download: ").strip()
+            save_dir = input("Enter destination folder: ").strip()
+            os.makedirs(save_dir, exist_ok=True)
+            download_file(file_name, save_dir)
+        elif choice == "4":
+            client_socket.send(struct.pack("I", 4))  # Exit command
+            exit_gracefully(None, None)
+        else:
+            print("[-] Invalid choice, try again.")
+
 
 
 if __name__ == "__main__":
