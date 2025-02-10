@@ -19,12 +19,15 @@ server_socket = None
 shutdown_event = threading.Event()
 
 
-def compute_checksum(file_path):
-    """Compute SHA256 checksum of a file."""
+def compute_checksum(data):
+    """Computes SHA-256 checksum of data (bytes or file path)."""
     sha256 = hashlib.sha256()
-    with open(file_path, "rb") as f:
-        while chunk := f.read(CHUNK_SIZE):
-            sha256.update(chunk)
+    if isinstance(data, str):  # File path case
+        with open(data, "rb") as f:
+            while chunk := f.read(CHUNK_SIZE):
+                sha256.update(chunk)
+    else:  # Bytes case (chunk)
+        sha256.update(data)
     return sha256.hexdigest()
 
 
@@ -40,61 +43,64 @@ def handle_client(client_socket, client_id):
             operation = struct.unpack("I", operation_data)[0]
 
             if operation == 1:  # Upload
-                    num_files = struct.unpack("I", client_socket.recv(4))[0]
+                num_files = struct.unpack("I", client_socket.recv(4))[0]
 
-                    for _ in range(num_files):
-                        path_length = struct.unpack("I", client_socket.recv(4))[0]
-                        file_path = client_socket.recv(path_length).decode()
-                        server_file_path = os.path.join(UPLOAD_DIR, f"client_{client_id}", file_path)
-                        os.makedirs(os.path.dirname(server_file_path), exist_ok=True)
-
-                        file_size = struct.unpack("Q", client_socket.recv(8))[0]
-
-                        with open(server_file_path, "wb") as f:
-                            while file_size > 0:
-                                chunk = client_socket.recv(min(CHUNK_SIZE, file_size))
+                for _ in range(num_files):
+                    path_length = struct.unpack("I", client_socket.recv(4))[0]
+                    file_path = client_socket.recv(path_length).decode()
+                    server_file_path = os.path.join(UPLOAD_DIR, file_path)
+                    os.makedirs(os.path.dirname(server_file_path), exist_ok=True)
+                    file_size = struct.unpack("Q", client_socket.recv(8))[0]
+                    with open(server_file_path, "wb") as f:
+                        while file_size > 0:
+                            chunk = client_socket.recv(min(CHUNK_SIZE, file_size))
+                            received_checksum = client_socket.recv(64).decode()
+                            if received_checksum == compute_checksum(chunk):
                                 f.write(chunk)
                                 file_size -= len(chunk)
-
-                        server_checksum = compute_checksum(server_file_path)
-                        client_socket.send(server_checksum.encode())
-
-                        client_checksum = client_socket.recv(64).decode()
-                        if client_checksum == server_checksum:
-                            print(f"[✔] [Client {client_id}] {file_path} received successfully ✅")
-                        else:
-                            print(f"[-] [Client {client_id}] {file_path} checksum mismatch ❌")
-            elif operation == 2:  # Download
-                try:
-                    path_length = struct.unpack("I", client_socket.recv(4))[0]
-                    file_name = client_socket.recv(path_length).decode()
-                    file_path = os.path.join(UPLOAD_DIR, file_name)
-
-                    if not os.path.exists(file_path):
-                        client_socket.send(struct.pack("Q", 0))  # File not found
-                        return
-
-                    file_size = os.path.getsize(file_path)
-                    client_socket.send(struct.pack("Q", file_size))
-
-                    with open(file_path, "rb") as f:
-                        while chunk := f.read(CHUNK_SIZE):
-                            client_socket.send(chunk)
-
-                    server_checksum = compute_checksum(file_path)
+                                client_socket.send(b"ACK")  # Acknowledge successful chunk reception
+                            else:
+                                print(f"[-] [Client {client_id}] Checksum mismatch, requesting retransmission...")
+                                client_socket.send(b"RETRY")  # Ask client to resend the last chunk
+                    
+                    server_checksum = compute_checksum(server_file_path)
                     client_socket.send(server_checksum.encode())
-
                     client_checksum = client_socket.recv(64).decode()
                     if client_checksum == server_checksum:
-                        print(f"[✔] {file_name} sent successfully ✅")
+                        print(f"[✔] [Client {client_id}] {file_path} received successfully ✅")
                     else:
-                        print(f"[-] {file_name} checksum mismatch ❌")
+                        print(f"[-] [Client {client_id}] {file_path} checksum mismatch ❌")
+            
+            elif operation == 2:  # Download
+                path_length = struct.unpack("I", client_socket.recv(4))[0]
+                file_name = client_socket.recv(path_length).decode()
+                file_path = os.path.join(UPLOAD_DIR, file_name)
+                if not os.path.exists(file_path):
+                    client_socket.send(struct.pack("Q", 0))  # File not found
+                    return
+                file_size = os.path.getsize(file_path)
+                client_socket.send(struct.pack("Q", file_size))
+                with open(file_path, "rb") as f:
+                    while chunk := f.read(CHUNK_SIZE):
+                        chunk_checksum = compute_checksum(chunk).encode()
+                        client_socket.send(chunk)
+                        client_socket.send(chunk_checksum)
+                        # Wait for acknowledgment or retransmission request
+                        response = client_socket.recv(5).decode()
+                        while response == "RETRY":
+                            print(f"[-] [Client {client_id}] Retransmitting last chunk...")
+                            client_socket.send(chunk)
+                            client_socket.send(chunk_checksum)
+                            response = client_socket.recv(5).decode()
 
-                except Exception as e:
-                    print(f"[-] [Client {client_id}] Error: {e}")
+                server_checksum = compute_checksum(file_path)
+                client_socket.send(server_checksum.encode())
 
-                finally:
-                    client_socket.close()
+                client_checksum = client_socket.recv(64).decode()
+                if client_checksum == server_checksum:
+                    print(f"[✔] {file_name} sent successfully ✅")
+                else:
+                    print(f"[-] {file_name} checksum mismatch ❌")
             
 
             elif operation == 3:  # List files
